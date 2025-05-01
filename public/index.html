@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Template Vector Database Generator</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/react@17.0.2/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@17.0.2/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.5.1/dist/socket.io.min.js"></script>
+  <style>
+    .animate-pulse {
+      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% {
+        opacity: 1;
+      }
+      50% {
+        opacity: .5;
+      }
+    }
+    
+    .animate-spin {
+      animation: spin 1s linear infinite;
+    }
+    
+    @keyframes spin {
+      from {
+        transform: rotate(0deg);
+      }
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+  <div id="app-root">
+    <!-- Loading indicator while React loads -->
+    <div class="flex justify-center items-center min-h-screen">
+      <div class="text-center">
+        <div class="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+        <p class="mt-4 text-gray-600">Loading Template Vector Database Generator...</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Initialize Socket.io connection
+    const socket = io();
+    let socketId = null;
+    
+    socket.on('connect', () => {
+      console.log('Connected to Socket.io. Socket ID:', socket.id);
+      socketId = socket.id;
+    });
+    
+    // App state
+    const appState = {
+      files: [],
+      uploadProgress: {},
+      processingStatus: {},
+      activeTab: 'upload',
+      processedTemplates: [],
+      databaseStats: null
+    };
+    
+    // Main App Component
+    function TemplateVectorDBGenerator() {
+      const [files, setFiles] = React.useState([]);
+      const [uploadProgress, setUploadProgress] = React.useState({});
+      const [processingStatus, setProcessingStatus] = React.useState({});
+      const [activeTab, setActiveTab] = React.useState('upload');
+      const [processedTemplates, setProcessedTemplates] = React.useState([]);
+      const [databaseStats, setDatabaseStats] = React.useState(null);
+      const [searchQuery, setSearchQuery] = React.useState('');
+      
+      React.useEffect(() => {
+        // Fetch templates on component mount
+        fetchTemplates();
+        fetchDatabaseStats();
+        
+        // Set up socket listeners
+        socket.on('processing-progress', (data) => {
+          console.log('Processing progress:', data);
+          setUploadProgress(prev => ({
+            ...prev,
+            [data.fileName]: data.progress
+          }));
+          
+          setProcessingStatus(prev => ({
+            ...prev,
+            [data.fileName]: data.status
+          }));
+        });
+        
+        socket.on('processing-complete', (data) => {
+          console.log('Processing complete:', data);
+          setProcessingStatus(prev => ({
+            ...prev,
+            [data.fileName]: 'completed'
+          }));
+          
+          // Refresh templates list after processing
+          fetchTemplates();
+          fetchDatabaseStats();
+        });
+        
+        socket.on('processing-error', (data) => {
+          console.error('Processing error:', data);
+          setProcessingStatus(prev => ({
+            ...prev,
+            [data.fileName]: 'error'
+          }));
+        });
+        
+        return () => {
+          // Clean up socket listeners
+          socket.off('processing-progress');
+          socket.off('processing-complete');
+          socket.off('processing-error');
+        };
+      }, []);
+      
+      const fetchTemplates = async () => {
+        try {
+          const response = await fetch('/api/templates');
+          if (response.ok) {
+            const data = await response.json();
+            if (data.success) {
+              setProcessedTemplates(data.templates);
+            }
+          }
+        } catch (error) {
+          console.error('Error fetching templates:', error);
+        }
+      };
+      
+      const fetchDatabaseStats = async () => {
+        try {
+          const response = await fetch('/api/stats');
+          if (response.ok) {
+            const data = await response.json();
+            if (data.success) {
+              setDatabaseStats(data.stats);
+            }
+          }
+        } catch (error) {
+          console.error('Error fetching database stats:', error);
+        }
+      };
+      
+      const handleFileChange = (e) => {
+        const newFiles = Array.from(e.target.files);
+        setFiles(prev => [...prev, ...newFiles]);
+        
+        // Initialize progress for each file
+        newFiles.forEach(file => {
+          setUploadProgress(prev => ({
+            ...prev,
+            [file.name]: 0
+          }));
+          
+          setProcessingStatus(prev => ({
+            ...prev,
+            [file.name]: 'pending'
+          }));
+        });
+      };
+      
+      const handleUpload = async () => {
+        for (const file of files) {
+          try {
+            const formData = new FormData();
+            formData.append('templateZip', file);
+            formData.append('socketId', socketId);
+            
+            setUploadProgress(prev => ({
+              ...prev,
+              [file.name]: 10
+            }));
+            
+            setProcessingStatus(prev => ({
+              ...prev,
+              [file.name]: 'uploading'
+            }));
+            
+            const response = await fetch('/api/upload', {
+              method: 'POST',
+              body: formData
+            });
+            
+            if (response.ok) {
+              const data = await response.json();
+              console.log('Upload successful:', data);
+              
+              setUploadProgress(prev => ({
+                ...prev,
+                [file.name]: 100
+              }));
+              
+              setProcessingStatus(prev => ({
+                ...prev,
+                [file.name]: 'extracting'
+              }));
+            } else {
+              throw new Error('Upload failed');
+            }
+          } catch (error) {
+            console.error('Error uploading file:', error);
+            setProcessingStatus(prev => ({
+              ...prev,
+              [file.name]: 'error'
+            }));
+          }
+        }
+      };
+      
+      const removeFile = (fileName) => {
+        setFiles(prev => prev.filter(file => file.name !== fileName));
+        setUploadProgress(prev => {
+          const newProgress = {...prev};
+          delete newProgress[fileName];
+          return newProgress;
+        });
+        
+        setProcessingStatus(prev => {
+          const newStatus = {...prev};
+          delete newStatus[fileName];
+          return newStatus;
+        });
+      };
+      
+      const deleteTemplate = async (templateId) => {
+        if (!confirm('Are you sure you want to delete this template?')) {
+          return;
+        }
+        
+        try {
+          const response = await fetch(`/api/templates/${templateId}`, {
+            method: 'DELETE'
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            if (data.success) {
+              // Refresh templates list and stats
+              fetchTemplates();
+              fetchDatabaseStats();
+            }
+          }
+        } catch (error) {
+          console.error('Error deleting template:', error);
+        }
+      };
+      
+      const filterTemplates = () => {
+        if (!searchQuery) {
+          return processedTemplates;
+        }
+        
+        const query = searchQuery.toLowerCase();
+        return processedTemplates.filter(template => 
+          template.name.toLowerCase().includes(query) ||
+          template.industry.toLowerCase().includes(query) ||
+          (template.componentTypes && template.componentTypes.some(type => type.toLowerCase().includes(query)))
+        );
+      };
+      
+      const getStatusLabel = (status) => {
+        switch(status) {
+          case 'pending': return 'Pending';
+          case 'uploading': return 'Uploading';
+          case 'extracting': return 'Extracting Files';
+          case 'analyzing': return 'Analyzing Structure';
+          case 'analyzing_structure': return 'Analyzing Structure';
+          case 'detecting_structure': return 'Detecting Framework';
+          case 'processing_css': return 'Processing CSS';
+          case 'processing_images': return 'Processing Images';
+          case 'extracting_components': return 'Extracting Components';
+          case 'processing_assets': return 'Processing Assets';
+          case 'embedding_generation': 
+          case 'generating_embeddings': return 'Generating Embeddings';
+          case 'storing_database': return 'Storing in Database';
+          case 'completed': return 'Completed';
+          case 'error': return 'Error';
+          default: return status;
+        }
+      };
+
+      return React.createElement('div', { className: 'max-w-6xl mx-auto bg-white rounded-lg shadow overflow-hidden my-8' },
+        // Header
+        React.createElement('div', { className: 'bg-blue-600 p-4 text-white' },
+          React.createElement('h1', { className: 'text-2xl font-bold' }, 'Template Vector Database Generator'),
+          React.createElement('p', { className: 'text-blue-100' }, 'Upload and process website templates to build your vector database')
+        ),
+        
+        // Navigation Tabs
+        React.createElement('div', { className: 'bg-gray-100 px-4 border-b' },
+          React.createElement('nav', { className: 'flex' },
+            React.createElement('button', { 
+              className: `px-4 py-3 font-medium ${activeTab === 'upload' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:text-blue-600'}`,
+              onClick: () => setActiveTab('upload')
+            }, 
+              React.createElement('i', { className: 'fas fa-upload mr-2' }),
+              'Upload Templates'
+            ),
+            React.createElement('button', { 
+              className: `px-4 py-3 font-medium ${activeTab === 'processed' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:text-blue-600'}`,
+              onClick: () => setActiveTab('processed')
+            }, 
+              React.createElement('i', { className: 'fas fa-search mr-2' }),
+              'Processed Templates'
+            ),
+            React.createElement('button', { 
+              className: `px-4 py-3 font-medium ${activeTab === 'database' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:text-blue-600'}`,
+              onClick: () => setActiveTab('database')
+            }, 
+              React.createElement('i', { className: 'fas fa-database mr-2' }),
+              'Database Stats'
+            )
+          )
+        ),
+        
+        // Content Area
+        React.createElement('div', { className: 'p-6' },
+          // Upload Templates Tab
+          activeTab === 'upload' && React.createElement('div', null,
+            React.createElement('div', { className: 'mb-6' },
+              React.createElement('label', { className: 'block mb-2 font-medium text-gray-700' }, 'Upload Template ZIP Files'),
+              React.createElement('div', { className: 'flex items-center justify-center w-full' },
+                React.createElement('label', { className: 'flex flex-col items-center justify-center w-full h-64 border-2 border-gray-300 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100' },
+                  React.createElement('div', { className: 'flex flex-col items-center justify-center pt-5 pb-6' },
+                    React.createElement('i', { className: 'fas fa-upload text-4xl mb-3 text-gray-400' }),
+                    React.createElement('p', { className: 'mb-2 text-sm text-gray-500' },
+                      React.createElement('span', { className: 'font-semibold' }, 'Click to upload'),
+                      ' or drag and drop'
+                    ),
+                    React.createElement('p', { className: 'text-xs text-gray-500' }, 'ZIP files only (Max size: 50MB)')
+                  ),
+                  React.createElement('input', { 
+                    type: 'file',
+                    accept: '.zip',
+                    multiple: true,
+                    className: 'hidden',
+                    onChange: handleFileChange
+                  })
+                )
+              )
+            ),
+            
+            files.length > 0 && React.createElement('div', { className: 'mb-6' },
+              React.createElement('h2', { className: 'text-lg font-medium text-gray-800 mb-4' }, 'Template Files'),
+              React.createElement('div', { className: 'space-y-4' },
+                files.map(file => React.createElement('div', { key: file.name, className: 'bg-gray-50 p-4 rounded-lg' },
+                  React.createElement('div', { className: 'flex justify-between items-center mb-2' },
+                    React.createElement('div', { className: 'flex items-center' },
+                      React.createElement('div', { className: 'ml-3' },
+                        React.createElement('p', { className: 'text-sm font-medium text-gray-900' }, file.name),
+                        React.createElement('p', { className: 'text-sm text-gray-500' }, `${(file.size / 1024 / 1024).toFixed(2)} MB`)
+                      )
+                    ),
+                    React.createElement('button', { 
+                      className: 'text-gray-400 hover:text-red-500',
+                      onClick: () => removeFile(file.name)
+                    },
+                      React.createElement('i', { className: 'fas fa-times' })
+                    )
+                  ),
+                  
+                  React.createElement('div', { className: 'w-full bg-gray-200 rounded-full h-2.5' },
+                    React.createElement('div', { 
+                      className: `h-2.5 rounded-full ${processingStatus[file.name] === 'error' ? 'bg-red-600' : 'bg-blue-600'}`,
+                      style: { width: `${uploadProgress[file.name]}%` }
+                    })
+                  ),
+                  
+                  React.createElement('div', { className: 'mt-2 flex justify-between items-center' },
+                    React.createElement('span', { className: 'text-xs font-medium text-gray-700' },
+                      processingStatus[file.name] === 'pending' 
+                        ? 'Ready to upload' 
+                        : getStatusLabel(processingStatus[file.name])
+                    ),
+                    React.createElement('span', { className: 'text-xs font-medium text-gray-700' }, `${uploadProgress[file.name]}%`)
+                  )
+                ))
+              ),
+              
+              React.createElement('div', { className: 'mt-6' },
+                React.createElement('button', { 
+                  className: 'px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500',
+                  onClick: handleUpload,
+                  disabled: files.length === 0 || files.every(file => processingStatus[file.name] !== 'pending')
+                }, 'Upload & Process All Files')
+              )
+            )
+          ),
+          
+          // Processed Templates Tab
+          activeTab === 'processed' && React.createElement('div', null,
+            React.createElement('div', { className: 'flex justify-between items-center mb-6' },
+              React.createElement('h2', { className: 'text-lg font-medium text-gray-800' }, 'Processed Templates'),
+              React.createElement('div', { className: 'relative' },
+                React.createElement('input', { 
+                  type: 'text',
+                  placeholder: 'Search templates...',
+                  className: 'pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500',
+                  value: searchQuery,
+                  onChange: (e) => setSearchQuery(e.target.value)
+                }),
+                React.createElement('i', { className: 'fas fa-search text-gray-400 absolute left-3 top-2.5' })
+              )
+            ),
+            
+            React.createElement('div', { className: 'overflow-x-auto bg-white shadow-md rounded-lg' },
+              React.createElement('table', { className: 'w-full text-sm text-left text-gray-500' },
+                React.createElement('thead', { className: 'text-xs text-gray-700 uppercase bg-gray-50' },
+                  React.createElement('tr', null,
+                    React.createElement('th', { scope: 'col', className: 'px-6 py-3' }, 'Template Name'),
+                    React.createElement('th', { scope: 'col', className: 'px-6 py-3' }, 'Industry'),
+                    React.createElement('th', { scope: 'col', className: 'px-6 py-3' }, 'Component Types'),
+                    React.createElement('th', { scope: 'col', className: 'px-6 py-3' }, 'Components'),
+                    React.createElement('th', { scope: 'col', className: 'px-6 py-3' }, 'Created Date'),
+                    React.createElement('th', { scope: 'col', className: 'px-6 py-3' }, 'Actions')
+                  )
+                ),
+                React.createElement('tbody', null,
+                  filterTemplates().length === 0 
+                    ? React.createElement('tr', { className: 'bg-white border-b' },
+                        React.createElement('td', { className: 'px-6 py-4', colSpan: 6 }, 
+                          'No templates found. Upload and process templates first.'
+                        )
+                      )
+                    : filterTemplates().map(template => React.createElement('tr', { key: template._id, className: 'bg-white border-b hover:bg-gray-50' },
+                        React.createElement('td', { className: 'px-6 py-4 font-medium text-gray-900' }, template.name),
+                        React.createElement('td', { className: 'px-6 py-4' }, template.industry),
+                        React.createElement('td', { className: 'px-6 py-4' }, 
+                          template.componentTypes && 
+                          template.componentTypes.map(type => 
+                            React.createElement('span', { 
+                              key: type, 
+                              className: 'inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1 mb-1' 
+                            }, type)
+                          )
+                        ),
+                        React.createElement('td', { className: 'px-6 py-4' }, template.componentCount),
+                        React.createElement('td', { className: 'px-6 py-4' }, 
+                          new Date(template.createdAt).toLocaleDateString()
+                        ),
+                        React.createElement('td', { className: 'px-6 py-4' },
+                          React.createElement('button', { 
+                            className: 'font-medium text-blue-600 hover:underline mr-2',
+                            onClick: () => window.open(`/api/templates/${template._id}`, '_blank')
+                          }, 'View'),
+                          React.createElement('button', { 
+                            className: 'font-medium text-red-600 hover:underline',
+                            onClick: () => deleteTemplate(template._id)
+                          }, 'Delete')
+                        )
+                      ))
+                )
+              )
+            )
+          ),
+          
+          // Database Stats Tab
+          activeTab === 'database' && databaseStats && React.createElement('div', null,
+            React.createElement('h2', { className: 'text-lg font-medium text-gray-800 mb-6' }, 'Vector Database Statistics'),
+            
+            React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-6 mb-8' },
+              React.createElement('div', { className: 'bg-white p-6 rounded-lg shadow-md' },
+                React.createElement('h3', { className: 'text-sm font-medium text-gray-500 mb-1' }, 'Total Templates'),
+                React.createElement('p', { className: 'text-3xl font-bold text-gray-900' }, databaseStats.totalTemplates)
+              ),
+              
+              React.createElement('div', { className: 'bg-white p-6 rounded-lg shadow-md' },
+                React.createElement('h3', { className: 'text-sm font-medium text-gray-500 mb-1' }, 'Total Components'),
+                React.createElement('p', { className: 'text-3xl font-bold text-gray-900' }, databaseStats.totalComponents)
+              ),
+              
+              React.createElement('div', { className: 'bg-white p-6 rounded-lg shadow-md' },
+                React.createElement('h3', { className: 'text-sm font-medium text-gray-500 mb-1' }, 'Component Types'),
+                React.createElement('p', { className: 'text-3xl font-bold text-gray-900' }, 
+                  databaseStats.categoriesCoverage ? Object.keys(databaseStats.categoriesCoverage).length : 0
+                )
+              )
+            ),
+            
+            React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-6' },
+              React.createElement('div', { className: 'bg-white p-6 rounded-lg shadow-md' },
+                React.createElement('h3', { className: 'text-sm font-medium text-gray-500 mb-4' }, 'Components by Category'),
+                React.createElement('div', { className: 'space-y-4' },
+                  databaseStats.categoriesCoverage && Object.entries(databaseStats.categoriesCoverage).map(([category, count]) => 
+                    React.createElement('div', { key: category, className: 'flex items-center' },
+                      React.createElement('span', { className: 'text-sm font-medium text-gray-700 w-24 capitalize' }, category),
+                      React.createElement('div', { className: 'flex-1' },
+                        React.createElement('div', { className: 'w-full bg-gray-200 rounded-full h-2.5' },
+                          React.createElement('div', { 
+                            className: 'h-2.5 rounded-full bg-blue-600',
+                            style: { width: `${(count / databaseStats.totalComponents) * 100}%` }
+                          })
+                        )
+                      ),
+                      React.createElement('span', { className: 'text-sm font-medium text-gray-700 ml-4' }, count)
+                    )
+                  )
+                )
+              ),
+              
+              React.createElement('div', { className: 'bg-white p-6 rounded-lg shadow-md' },
+                React.createElement('h3', { className: 'text-sm font-medium text-gray-500 mb-4' }, 'Templates by Industry'),
+                React.createElement('div', { className: 'space-y-4' },
+                  databaseStats.industriesCoverage && Object.entries(databaseStats.industriesCoverage).map(([industry, count]) => 
+                    React.createElement('div', { key: industry, className: 'flex items-center' },
+                      React.createElement('span', { className: 'text-sm font-medium text-gray-700 w-24 capitalize' }, industry),
+                      React.createElement('div', { className: 'flex-1' },
+                        React.createElement('div', { className: 'w-full bg-gray-200 rounded-full h-2.5' },
+                          React.createElement('div', { 
+                            className: 'h-2.5 rounded-full bg-green-600',
+                            style: { width: `${(count / databaseStats.totalTemplates) * 100}%` }
+                          })
+                        )
+                      ),
+                      React.createElement('span', { className: 'text-sm font-medium text-gray-700 ml-4' }, count)
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      );
+    }
+
+    // Render the React component
+    ReactDOM.render(
+      React.createElement(TemplateVectorDBGenerator, null),
+      document.getElementById('app-root')
+    );
+  </script>
+</body>
+</html>

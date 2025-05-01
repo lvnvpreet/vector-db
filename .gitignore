@@ -1,0 +1,9 @@
+node_modules/
+combined.log
+error.log
+uploads/
+extracted_templates/
+public/assets/
+
+
+.env
