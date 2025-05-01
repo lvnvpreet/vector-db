@@ -4,7 +4,7 @@ const path = require('path');
 const AdmZip = require('adm-zip');
 const cheerio = require('cheerio');
 const { v4: uuidv4 } = require('uuid');
-const { OpenAIEmbeddings } = require('langchain/embeddings/openai');
+const axios = require('axios'); // Replace OpenAI with axios for Ollama API calls
 const { MongoClient } = require('mongodb');
 const sharp = require('sharp');
 const glob = require('glob');
@@ -16,8 +16,10 @@ class AdaptiveTemplateProcessor {
     this.assetsDir = config.assetsDir || path.join(__dirname, 'public', 'assets');
     this.mongoUri = config.mongoUri || 'mongodb://localhost:27017';
     this.dbName = config.dbName || 'template_vector_db';
-    this.apiKey = config.apiKey || process.env.OPENAI_API_KEY;
-    this.embeddings = new OpenAIEmbeddings({ openAIApiKey: this.apiKey });
+    
+    // Ollama configuration
+    this.ollamaUrl = config.ollamaUrl || process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
+    this.ollamaModel = config.ollamaModel || process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
     
     this.ensureDirectoryExists(this.templatesDir);
     this.ensureDirectoryExists(this.outputDir);
@@ -73,6 +75,27 @@ class AdaptiveTemplateProcessor {
   ensureDirectoryExists(dir) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  // Method to generate embeddings using Ollama API
+  async generateOllamaEmbedding(text) {
+    try {
+      const response = await axios.post(`${this.ollamaUrl}/api/embeddings`, {
+        model: this.ollamaModel,
+        prompt: text
+      });
+      
+      // Extract embedding from response
+      if (response.data && response.data.embedding) {
+        return response.data.embedding;
+      } else {
+        throw new Error('Invalid response from Ollama API');
+      }
+    } catch (error) {
+      console.error('Error generating embedding with Ollama:', error);
+      // Return empty array as fallback
+      return [];
     }
   }
 
@@ -1876,8 +1899,8 @@ class AdaptiveTemplateProcessor {
           HTML Content Summary: ${this.summarizeHtml(component.html)}
         `;
         
-        // Generate embedding
-        const embedding = await this.embeddings.embedQuery(textForEmbedding);
+        // Generate embedding using Ollama
+        const embedding = await this.generateOllamaEmbedding(textForEmbedding);
         
         // Add embedding to component
         result.push({
