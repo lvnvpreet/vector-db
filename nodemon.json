@@ -1,0 +1,4 @@
+
+{
+  "ignore": ["uploads/*", "extracted_templates/*", "public/assets/*"]
+}

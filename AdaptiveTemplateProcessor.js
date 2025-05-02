@@ -4,7 +4,7 @@ const path = require('path');
 const AdmZip = require('adm-zip');
 const cheerio = require('cheerio');
 const { v4: uuidv4 } = require('uuid');
-const axios = require('axios'); // Replace OpenAI with axios for Ollama API calls
+const axios = require('axios');
 const { MongoClient } = require('mongodb');
 const sharp = require('sharp');
 const glob = require('glob');
@@ -18,8 +18,11 @@ class AdaptiveTemplateProcessor {
     this.dbName = config.dbName || 'template_vector_db';
     
     // Ollama configuration
-    this.ollamaUrl = config.ollamaUrl || process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
+    this.ollamaUrl = config.ollamaUrl || process.env.OLLAMA_BASE_URL || 'http://175.111.130.242:11434';
     this.ollamaModel = config.ollamaModel || process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
+    
+    // Add debug mode here
+    this.debugMode = config.debugMode || process.env.DEBUG_MODE === 'true';
     
     this.ensureDirectoryExists(this.templatesDir);
     this.ensureDirectoryExists(this.outputDir);
@@ -80,27 +83,47 @@ class AdaptiveTemplateProcessor {
 
   // Method to generate embeddings using Ollama API
   async generateOllamaEmbedding(text) {
+    console.log(this.ollamaUrl)
     try {
+      if (this.debugMode) {
+        console.log(`Debug: Connecting to Ollama at ${this.ollamaUrl}`);
+      }
+      
       const response = await axios.post(`${this.ollamaUrl}/api/embeddings`, {
         model: this.ollamaModel,
         prompt: text
+      }, {
+        timeout: 30000 // 30 second timeout
       });
       
-      // Extract embedding from response
       if (response.data && response.data.embedding) {
+        if (this.debugMode) {
+          console.log(`Debug: Successfully generated embedding of size ${response.data.embedding.length}`);
+        }
         return response.data.embedding;
       } else {
-        throw new Error('Invalid response from Ollama API');
+        console.error('Invalid response from Ollama API:', response.data);
+        // Return zero vector as fallback (with 1536 dimensions - matches common embedding size)
+        return new Array(1536).fill(0);
       }
     } catch (error) {
-      console.error('Error generating embedding with Ollama:', error);
-      // Return empty array as fallback
-      return [];
+      console.error('Error generating embedding with Ollama:', error.message);
+      if (error.code === 'ECONNREFUSED') {
+        console.error(`Could not connect to Ollama server at ${this.ollamaUrl}. Make sure Ollama is running.`);
+      }
+      // Return zero vector as fallback (with 1536 dimensions)
+      return new Array(1536).fill(0);
     }
   }
 
   async processTemplateZip(zipFilePath, options = {}) {
     const zipFileName = path.basename(zipFilePath);
+    const templateName = path.basename(zipFileName, '.zip');
+    
+    if (this.debugMode) {
+      console.log('Debug: Starting to process ZIP file:', zipFilePath);
+    }
+    
     this.emit('progress', {
       status: 'starting',
       message: `Starting to process ${zipFileName}`,
@@ -130,6 +153,7 @@ class AdaptiveTemplateProcessor {
       // Extract ZIP contents
       zip.extractAllTo(extractDir, true);
       
+      // Extract file structure
       this.emit('progress', {
         status: 'analyzing_structure',
         message: `Analyzing template structure`,
@@ -139,6 +163,9 @@ class AdaptiveTemplateProcessor {
       // Detect template structure
       const structure = this.detectTemplateStructure(allFiles, extractDir);
       console.log(`Detected structure: ${structure.name} for ${zipFileName}`);
+      
+      // Extract template structure
+      const templateStructure = await this.extractTemplateStructure(extractDir, templateName);
       
       // Find HTML files
       const htmlFiles = this.findFiles(extractDir, '.html');
@@ -195,6 +222,12 @@ class AdaptiveTemplateProcessor {
       // Store in MongoDB
       if (!options.skipDatabaseStorage) {
         await this.storeComponentsInDatabase(componentsWithEmbeddings);
+        await this.storeTemplateStructure(templateStructure, templateInfo);
+        
+        // Generate and store template-level embedding
+        if (componentsWithEmbeddings.length > 0) {
+          await this.generateTemplateEmbedding(templateInfo, componentsWithEmbeddings, templateStructure);
+        }
       }
       
       this.emit('progress', {
@@ -210,7 +243,8 @@ class AdaptiveTemplateProcessor {
       
       return {
         templateInfo,
-        components: componentsWithEmbeddings
+        components: componentsWithEmbeddings,
+        templateStructure
       };
     } catch (error) {
       console.error(`Error processing template ${zipFilePath}:`, error);
@@ -284,6 +318,134 @@ class AdaptiveTemplateProcessor {
     }
     
     return structure;
+  }
+
+  // Dynamic template structure extraction
+  async extractTemplateStructure(extractDir, templateName) {
+    // This will be our dynamic JSON structure
+    const templateStructure = {};
+    
+    // Function to recursively process a directory and build the structure
+    const processDirectory = (currentPath, currentObj) => {
+      const entries = fs.readdirSync(currentPath);
+      
+      // Process each entry (file or folder)
+      for (const entry of entries) {
+        // Skip hidden files/folders
+        if (entry.startsWith('.')) continue;
+        
+        const entryPath = path.join(currentPath, entry);
+        const stats = fs.statSync(entryPath);
+        
+        if (stats.isDirectory()) {
+          // If it's a directory, create a new object and process recursively
+          currentObj[entry] = {};
+          processDirectory(entryPath, currentObj[entry]);
+        } else {
+          // It's a file - handle based on file type
+          const ext = path.extname(entry).toLowerCase();
+          const isBinary = ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', 
+                            '.woff', '.woff2', '.ttf', '.eot', '.ico', 
+                            '.pdf', '.zip', '.mp3', '.mp4'].includes(ext);
+          
+          if (isBinary) {
+            // For binary files, store a reference to the asset
+            const relativePath = path.relative(extractDir, entryPath).replace(/\\/g, '/');
+            const destinationPath = path.join(this.assetsDir, templateName, relativePath);
+            
+            // Ensure destination directory exists
+            this.ensureDirectoryExists(path.dirname(destinationPath));
+            
+            // Copy file to assets folder
+            fs.copyFileSync(entryPath, destinationPath);
+            
+            // Store reference to the file
+            currentObj[entry] = `/assets/${templateName}/${relativePath}`;
+          } else {
+            // For text files, store the content
+            try {
+              const content = fs.readFileSync(entryPath, 'utf8');
+              currentObj[entry] = content;
+            } catch (error) {
+              if (this.debugMode) {
+                console.log(`Debug: Error reading file ${entryPath}:`, error.message);
+              }
+              // If can't read as text, store as binary reference
+              const relativePath = path.relative(extractDir, entryPath).replace(/\\/g, '/');
+              const destinationPath = path.join(this.assetsDir, templateName, relativePath);
+              
+              this.ensureDirectoryExists(path.dirname(destinationPath));
+              fs.copyFileSync(entryPath, destinationPath);
+              currentObj[entry] = `/assets/${templateName}/${relativePath}`;
+            }
+          }
+        }
+      }
+    };
+    
+    // Start processing from the root directory
+    templateStructure[templateName] = {};
+    processDirectory(extractDir, templateStructure[templateName]);
+    
+    return templateStructure;
+  }
+
+  // Store template structure in database
+  async storeTemplateStructure(templateStructure, templateInfo) {
+    let client = null;
+    
+    try {
+      client = new MongoClient(this.mongoUri);
+      await client.connect();
+      
+      const db = client.db(this.dbName);
+      const collection = db.collection('template_structures');
+      
+      // Store the structure
+      const templateName = Object.keys(templateStructure)[0];
+      const document = {
+        _id: templateInfo.id,
+        name: templateName,
+        structure: templateStructure,
+        industry: templateInfo.industry,
+        styleType: templateInfo.styleType,
+        createdAt: new Date()
+      };
+      
+      await collection.updateOne(
+        { _id: templateInfo.id },
+        { $set: document },
+        { upsert: true }
+      );
+      
+      // Also update the templates collection
+      const templateCollection = db.collection('templates');
+      const templateDocument = {
+        _id: templateInfo.id,
+        name: templateName,
+        industry: templateInfo.industry,
+        styleType: templateInfo.styleType,
+        hasStructure: true,
+        createdAt: new Date()
+      };
+      
+      await templateCollection.updateOne(
+        { _id: templateInfo.id },
+        { $set: templateDocument },
+        { upsert: true }
+      );
+      
+      if (this.debugMode) {
+        console.log(`Debug: Stored template structure for ${templateName}`);
+      }
+    } catch (error) {
+      console.error('Error storing template structure in database:', error);
+      throw error;
+    } finally {
+      if (client) {
+        await client.close();
+      }
+    }
   }
 
   getMostCommonPaths(paths) {
@@ -419,9 +581,14 @@ class AdaptiveTemplateProcessor {
         .jpeg({ quality: 85, progressive: true })
         .toFile(destImagePath);
     } catch (error) {
-      console.warn(`Error optimizing image ${sourceImagePath}:`, error);
+      console.error(`Error optimizing image ${sourceImagePath}:`, error);
       // Fallback to direct copy if optimization fails
-      fs.copyFileSync(sourceImagePath, destImagePath);
+      try {
+        fs.copyFileSync(sourceImagePath, destImagePath);
+        console.log(`Fallback copy successful for ${sourceImagePath}`);
+      } catch (copyError) {
+        console.error(`Even fallback copy failed for ${sourceImagePath}:`, copyError);
+      }
     }
   }
 
@@ -1889,7 +2056,7 @@ class AdaptiveTemplateProcessor {
     
     for (const component of componentBatch) {
       try {
-        // Create text representation of the component for embedding
+        // Enhanced text representation with use-case information
         const textForEmbedding = `
           Component Type: ${component.type}
           Name: ${component.name}
@@ -1897,24 +2064,125 @@ class AdaptiveTemplateProcessor {
           Style: ${component.styleType}
           Attributes: ${JSON.stringify(component.attributes)}
           HTML Content Summary: ${this.summarizeHtml(component.html)}
+          
+          Suitable For: ${this.determineSuitability(component)}
+          Common Pairings: ${this.suggestComplementaryComponents(component)}
+          Customization Options: ${this.suggestCustomizations(component)}
         `;
         
         // Generate embedding using Ollama
         const embedding = await this.generateOllamaEmbedding(textForEmbedding);
         
-        // Add embedding to component
+        // Add embedding and enhanced metadata to component
         result.push({
           ...component,
-          embedding
+          embedding,
+          useCaseInfo: {
+            suitability: this.determineSuitability(component),
+            complementaryComponents: this.suggestComplementaryComponents(component),
+            customizationOptions: this.suggestCustomizations(component)
+          }
         });
       } catch (error) {
         console.error(`Error generating embedding for component ${component.id}:`, error);
-        // Add component without embedding so we don't lose it
         result.push(component);
       }
     }
     
     return result;
+  }
+
+  // Determine component suitability based on type and attributes
+  determineSuitability(component) {
+    const suitabilityMap = {
+      'header': () => {
+        const scenarios = [];
+        if (component.attributes.hasLogo) scenarios.push('branded websites');
+        if (component.attributes.hasSearch) scenarios.push('content-rich websites');
+        if (component.attributes.hasNavigation) scenarios.push('multi-page websites');
+        if (component.attributes.isSticky) scenarios.push('long-scroll pages');
+        return scenarios.length > 0 ? scenarios.join(', ') : 'general websites';
+      },
+      'hero': () => {
+        const scenarios = [];
+        if (component.attributes.hasButton) scenarios.push('conversion-focused pages');
+        if (component.attributes.hasImage) scenarios.push('visual storytelling');
+        if (component.attributes.isFullscreen) scenarios.push('immersive experiences');
+        if (component.attributes.isCarousel) scenarios.push('showcasing multiple offerings');
+        return scenarios.length > 0 ? scenarios.join(', ') : 'website homepages';
+      },
+      'features': () => {
+        const scenarios = [];
+        if (component.attributes.hasIcons) scenarios.push('service-based businesses');
+        if (component.attributes.hasImages) scenarios.push('visual product showcases');
+        if (component.attributes.columnCount > 3) scenarios.push('detailed feature comparisons');
+        if (component.attributes.hasCards) scenarios.push('product or service catalogs');
+        return scenarios.length > 0 ? scenarios.join(', ') : 'highlighting key offerings';
+      },
+      'testimonials': () => {
+        const scenarios = [];
+        if (component.attributes.hasAvatar) scenarios.push('personal service businesses');
+        if (component.attributes.isCarousel) scenarios.push('space-saving layouts');
+        if (component.attributes.testimonialCount > 3) scenarios.push('trust-building for new brands');
+        return scenarios.length > 0 ? scenarios.join(', ') : 'social proof sections';
+      },
+      'contact': () => {
+        const scenarios = [];
+        if (component.attributes.hasMap) scenarios.push('local businesses');
+        if (component.attributes.hasMessageField) scenarios.push('service inquiries');
+        if (component.attributes.hasCaptcha) scenarios.push('high-traffic websites');
+        return scenarios.length > 0 ? scenarios.join(', ') : 'lead generation forms';
+      },
+      'footer': () => {
+        const scenarios = [];
+        if (component.attributes.hasSocialLinks) scenarios.push('social media marketing');
+        if (component.attributes.hasMultiColumn) scenarios.push('content-rich websites');
+        if (component.attributes.hasNewsletter) scenarios.push('email marketing strategies');
+        return scenarios.length > 0 ? scenarios.join(', ') : 'site navigation and legal info';
+      }
+    };
+    
+    return suitabilityMap[component.type] ? 
+      suitabilityMap[component.type]() : 
+      `${component.industry} websites with ${component.styleType} style`;
+  }
+
+  // Suggest complementary components
+  suggestComplementaryComponents(component) {
+    const complementaryMap = {
+      'header': ['hero', 'navigation'],
+      'hero': ['features', 'call-to-action'],
+      'features': ['testimonials', 'pricing'],
+      'testimonials': ['contact', 'call-to-action'],
+      'footer': ['contact', 'newsletter'],
+      'contact': ['map', 'company-info'],
+      'blog': ['categories', 'search', 'related-posts'],
+      'products': ['filters', 'pricing', 'related-products'],
+      'team': ['about', 'testimonials'],
+      'portfolio': ['filters', 'case-studies']
+    };
+    
+    return complementaryMap[component.type] ? 
+      complementaryMap[component.type].join(', ') : 
+      'any standard website components';
+  }
+
+  // Suggest customization options
+  suggestCustomizations(component) {
+    const customizationMap = {
+      'header': 'logo placement, menu items, color scheme, sticky behavior',
+      'hero': 'background image, headline text, button style, overlay opacity',
+      'features': 'icon style, number of columns, card design, hover effects',
+      'testimonials': 'quote style, avatar size, carousel speed, rating display',
+      'contact': 'form fields, map integration, contact info display',
+      'footer': 'column layout, social icons, copyright text, newsletter signup',
+      'blog': 'post layout, featured image size, metadata display, read more link',
+      'products': 'grid layout, image aspect ratio, pricing display, CTA buttons',
+      'team': 'profile layout, social links, bio length, hover effects',
+      'portfolio': 'gallery style, filtering options, project details, hover effects'
+    };
+    
+    return customizationMap[component.type] || 'colors, fonts, spacing, and content';
   }
 
   summarizeHtml(html) {
@@ -1991,6 +2259,7 @@ class AdaptiveTemplateProcessor {
           styleType: component.styleType,
           attributes: component.attributes,
           embedding: component.embedding,
+          useCaseInfo: component.useCaseInfo || {},
           createdAt: new Date()
         }));
         
@@ -2033,6 +2302,269 @@ class AdaptiveTemplateProcessor {
         await client.close();
       }
     }
+  }
+
+  // Template-level embedding generation
+  async generateTemplateEmbedding(templateInfo, components, templateStructure) {
+    // Extract key features from the template
+    const keyFeatures = this.extractKeyFeatures(components);
+    const pageTypes = this.extractPageTypes(templateStructure);
+    const colorScheme = this.extractColorScheme(components);
+    const layoutPattern = this.analyzeLayoutPattern(components);
+    
+    // Create text representation for embedding
+    const templateTextForEmbedding = `
+      Template Name: ${templateInfo.name}
+      Industry: ${templateInfo.industry}
+      Style: ${templateInfo.styleType}
+      Key Features: ${keyFeatures}
+      Page Types: ${pageTypes}
+      Color Scheme: ${colorScheme}
+      Layout Pattern: ${layoutPattern}
+      Best Used For: ${this.suggestUseCase(templateInfo, components)}
+    `;
+    
+    // Generate embedding using Ollama
+    const embedding = await this.generateOllamaEmbedding(templateTextForEmbedding);
+    
+    // Store in database
+    await this.storeTemplateEmbedding(templateInfo.id, embedding, {
+      keyFeatures,
+      pageTypes,
+      colorScheme,
+      layoutPattern,
+      bestUsedFor: this.suggestUseCase(templateInfo, components)
+    });
+    
+    return embedding;
+  }
+
+  // Store template embedding in database
+  async storeTemplateEmbedding(templateId, embedding, metaData) {
+    let client = null;
+    
+    try {
+      client = new MongoClient(this.mongoUri);
+      await client.connect();
+      
+      const db = client.db(this.dbName);
+      const collection = db.collection('template_embeddings');
+      
+      const document = {
+        _id: templateId,
+        embedding,
+        metaData,
+        createdAt: new Date()
+      };
+      
+      await collection.updateOne(
+        { _id: templateId },
+        { $set: document },
+        { upsert: true }
+      );
+      
+      if (this.debugMode) {
+        console.log(`Debug: Stored template embedding for ${templateId}`);
+      }
+    } catch (error) {
+      console.error('Error storing template embedding in database:', error);
+      throw error;
+    } finally {
+      if (client) {
+        await client.close();
+      }
+    }
+  }
+
+  // Extract key features from components
+  extractKeyFeatures(components) {
+    const features = new Set();
+    
+    // Identify key features based on components
+    components.forEach(component => {
+      if (component.type === 'contact' && component.attributes.hasMap) 
+        features.add('map integration');
+      if (component.type === 'hero' && component.attributes.isCarousel) 
+        features.add('image carousel');
+      if (component.type === 'header' && component.attributes.isSticky)
+        features.add('sticky header');
+      if (component.type === 'footer' && component.attributes.hasSocialLinks)
+        features.add('social media integration');
+      if (component.type === 'features' && component.attributes.hasIcons)
+        features.add('icon-based features');
+      if (component.type === 'testimonials' && component.attributes.hasAvatar)
+        features.add('testimonials with avatars');
+    });
+    
+    const industryFeatures = {
+      'realestate': ['property listings', 'search filters'],
+      'restaurant': ['online menu', 'reservation system'],
+      'ecommerce': ['product showcase', 'shopping cart'],
+      'education': ['course listings', 'enrollment forms'],
+      'health': ['appointment booking', 'service listings'],
+      'portfolio': ['project gallery', 'case studies'],
+      'business': ['service descriptions', 'team profiles'],
+      'travel': ['destination guides', 'booking forms']
+    };
+    
+    // Add industry-specific features if components suggest they exist
+    const industry = components[0]?.industry;
+    if (industry && industryFeatures[industry]) {
+      industryFeatures[industry].forEach(feature => {
+        if (this.hasIndustryFeature(components, feature)) 
+          features.add(feature);
+      });
+    }
+    
+    return Array.from(features).join(', ') || 'standard website features';
+  }
+
+  // Extract page types from template structure
+  extractPageTypes(templateStructure) {
+    // Identify page types from filenames
+    const pageTypes = new Set();
+    const templateName = Object.keys(templateStructure)[0];
+    
+    // Check root files for common page types
+    Object.keys(templateStructure[templateName]).forEach(file => {
+      if (file.endsWith('.html')) {
+        if (file === 'index.html') pageTypes.add('homepage');
+        if (file.includes('about')) pageTypes.add('about page');
+        if (file.includes('contact')) pageTypes.add('contact page');
+        if (file.includes('service')) pageTypes.add('services page');
+        if (file.includes('product')) pageTypes.add('product page');
+        if (file.includes('portfolio')) pageTypes.add('portfolio page');
+        if (file.includes('blog')) pageTypes.add('blog page');
+        if (file.includes('gallery')) pageTypes.add('gallery page');
+        if (file.includes('team')) pageTypes.add('team page');
+        if (file.includes('faq')) pageTypes.add('FAQ page');
+        if (file.includes('pricing')) pageTypes.add('pricing page');
+      }
+    });
+    
+    return Array.from(pageTypes).join(', ') || 'basic page templates';
+  }
+
+  // Extract color scheme from CSS
+  extractColorScheme(components) {
+    // This is a simple color extraction - would need more sophisticated analysis for production
+    const colorMentions = {
+      'dark': 0,
+      'light': 0,
+      'blue': 0,
+      'green': 0,
+      'red': 0,
+      'purple': 0,
+      'orange': 0,
+      'black': 0,
+      'white': 0,
+      'gray': 0
+    };
+    
+    // Count color mentions in CSS
+    components.forEach(component => {
+      if (!component.css) return;
+      
+      Object.keys(colorMentions).forEach(color => {
+        const regex = new RegExp(color, 'gi');
+        const matches = (component.css.match(regex) || []).length;
+        colorMentions[color] += matches;
+      });
+    });
+    
+    // Find top 3 colors
+    const topColors = Object.entries(colorMentions)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .filter(([_, count]) => count > 0)
+      .map(([color, _]) => color);
+    
+    return topColors.join(', ') || 'neutral color scheme';
+  }
+
+  // Analyze layout patterns
+  analyzeLayoutPattern(components) {
+    // Analyze component structure to determine layout patterns
+    const patterns = [];
+    
+    // Check for common patterns
+    const hasHero = components.some(c => c.type === 'hero');
+    const hasFeatures = components.some(c => c.type === 'features');
+    const hasTestimonials = components.some(c => c.type === 'testimonials');
+    
+    if (hasHero) patterns.push('hero-based');
+    if (hasFeatures) {
+      const featureComponents = components.filter(c => c.type === 'features');
+      const multiColumn = featureComponents.some(c => 
+        c.attributes.columnCount && c.attributes.columnCount > 2
+      );
+      if (multiColumn) patterns.push('multi-column grid');
+    }
+    
+    if (hasHero && hasFeatures && hasTestimonials) {
+      patterns.push('standard marketing layout');
+    }
+    
+    return patterns.join(', ') || 'conventional layout';
+  }
+
+  // Suggest use cases based on template characteristics
+  suggestUseCase(templateInfo, components) {
+    // Suggest primary use case based on template characteristics
+    const industry = templateInfo.industry;
+    const style = templateInfo.styleType;
+    
+    const industryUseCases = {
+      'realestate': 'property listings and real estate agent websites',
+      'restaurant': 'restaurant menus and online ordering systems',
+      'ecommerce': 'online stores and product catalogs',
+      'education': 'educational institutions and online courses',
+      'health': 'healthcare providers and wellness services',
+      'business': 'business services and corporate websites',
+      'portfolio': 'showcasing work and professional profiles',
+      'travel': 'travel agencies and tourism destinations'
+    };
+    
+    const styleUseCases = {
+      'modern': 'contemporary brands seeking a clean, current aesthetic',
+      'minimalist': 'brands focusing on simplicity and essential content',
+      'elegant': 'luxury brands and premium services',
+      'creative': 'artists, agencies, and creative businesses',
+      'corporate': 'established businesses and professional services',
+      'classic': 'traditional businesses with timeless appeal'
+    };
+    
+    return `${industryUseCases[industry] || industry + ' websites'} with ${styleUseCases[style] || style + ' styling'}`;
+  }
+
+  // Check if template has industry-specific features
+  hasIndustryFeature(components, feature) {
+    // Check if components suggest a specific industry feature exists
+    if (feature === 'property listings') {
+      return components.some(c => c.type === 'property-listing');
+    }
+    if (feature === 'search filters') {
+      return components.some(c => c.type === 'property-search');
+    }
+    if (feature === 'online menu') {
+      return components.some(c => c.type === 'restaurant-menu');
+    }
+    if (feature === 'reservation system') {
+      return components.some(c => c.type === 'restaurant-reservation');
+    }
+    if (feature === 'shopping cart') {
+      return components.some(c => c.type === 'shopping-cart');
+    }
+    if (feature === 'product showcase') {
+      return components.some(c => c.type === 'products');
+    }
+    if (feature === 'course listings') {
+      return components.some(c => c.type === 'course-listing');
+    }
+    if (feature === 'team profiles') {
+      return components.some(c => c.type === 'team');
+    }
+    return false;
   }
 }
 
